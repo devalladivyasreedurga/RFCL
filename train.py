@@ -25,7 +25,7 @@ import torch.optim as optim
 from data    import get_task_loaders, NUM_TASKS, get_task_classes
 from model   import ContinualResNet
 from metrics import evaluate, compute_aa_bwt, ResourceTracker
-from methods import METHOD_REGISTRY
+from methods import METHOD_REGISTRY, apply_prototype_alignment
 
 # ── config ───────────────────────────────────────────────────────────────────
 EPOCHS_PER_TASK = 5
@@ -44,9 +44,10 @@ def get_device():
 
 # ── single method run ────────────────────────────────────────────────────────
 
-def run_method(method_name: str, device: torch.device) -> dict:
+def run_method(method_name: str, device: torch.device, align: bool = False) -> dict:
+    label = method_name.upper() + (" + Prototype Alignment" if align else "")
     print(f"\n{'='*60}")
-    print(f"  Method: {method_name.upper()}")
+    print(f"  Method: {label}")
     print(f"{'='*60}")
 
     method_cls = METHOD_REGISTRY[method_name]
@@ -99,6 +100,10 @@ def run_method(method_name: str, device: torch.device) -> dict:
         # After-task hook (EWC fisher, etc.)
         method.after_task(model, task_id, train_loader, device)
 
+        # Optional prototype alignment (fixes logit imbalance / task-recency bias)
+        if align:
+            apply_prototype_alignment(model, train_loader, task_id, device)
+
         # ── evaluation on all seen tasks ──────────────────────────────────────
         model.eval()
         for prev_id in range(task_id + 1):
@@ -108,14 +113,16 @@ def run_method(method_name: str, device: torch.device) -> dict:
 
     # ── summary ───────────────────────────────────────────────────────────────
     aa, bwt = compute_aa_bwt(acc_matrix)
-    print(f"\n  ── {method_name.upper()} Final Results ──")
+    print(f"\n  ── {label} Final Results ──")
     print(f"  Average Accuracy (AA):   {aa*100:.2f}%")
     print(f"  Backward Transfer (BWT): {bwt*100:.2f}%")
     print(f"  Mean time/task:          {np.mean(task_times):.1f}s")
     print(f"  Mean RAM Δ/task:         {np.mean(task_rams):.1f} MB")
 
+    result_key = f"{method_name}_align" if align else method_name
     results = {
-        "method":       method_name,
+        "method":       result_key,
+        "align":        align,
         "acc_matrix":   acc_matrix.tolist(),
         "aa":           round(aa * 100, 2),
         "bwt":          round(bwt * 100, 2),
@@ -123,7 +130,7 @@ def run_method(method_name: str, device: torch.device) -> dict:
         "task_rams_mb": [round(r, 2) for r in task_rams],
     }
 
-    out_path = os.path.join(RESULTS_DIR, f"{method_name}.json")
+    out_path = os.path.join(RESULTS_DIR, f"{result_key}.json")
     with open(out_path, "w") as f:
         json.dump(results, f, indent=2)
     print(f"  Results saved → {out_path}")
@@ -137,6 +144,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--method", default="all",
                         choices=list(METHOD_REGISTRY.keys()) + ["all"])
+    parser.add_argument("--align", action="store_true",
+                        help="Apply prototype alignment after each task")
     args = parser.parse_args()
 
     device = get_device()
@@ -146,10 +155,11 @@ def main():
     all_results = {}
 
     for m in methods:
-        all_results[m] = run_method(m, device)
+        all_results[m] = run_method(m, device, align=args.align)
 
     if len(methods) > 1:
-        print("\n\n── Summary Table ──────────────────────────────────────────")
+        suffix = " (+align)" if args.align else ""
+        print(f"\n\n── Summary Table{suffix} ─────────────────────────────────────")
         print(f"{'Method':<10} {'AA (%)':>8} {'BWT (%)':>9} {'Time/task (s)':>15} {'RAM Δ (MB)':>12}")
         print("-" * 58)
         for m, r in all_results.items():

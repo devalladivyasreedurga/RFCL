@@ -6,6 +6,10 @@ Four methods implemented:
     2. EWC           — Elastic Weight Consolidation [Kirkpatrick et al. 2017]
     3. LwF           — Learning without Forgetting [Li & Hoiem 2016]
     4. Hybrid        — EWC + LwF with task-adaptive distillation weight
+
+Post-task calibration:
+    apply_prototype_alignment — replace head weights with L2-normalised class prototypes
+                                (mean backbone feature per class) to fix logit imbalance.
 """
 
 import copy
@@ -207,6 +211,55 @@ class HybridMethod:
     def after_task(self, model, task_id, train_loader, device):
         self._ewc.after_task(model, task_id, train_loader, device)
         # LwF doesn't need after_task
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Prototype alignment (post-task calibration)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def apply_prototype_alignment(model, train_loader, task_id: int, device: torch.device):
+    """
+    After training on task_id, replace each class's head weight with the
+    L2-normalised mean backbone feature (prototype) for that class.
+
+    This removes task-recency bias: newly trained logits are larger in magnitude
+    than old ones, causing old-task predictions to collapse under softmax even
+    when the backbone still produces separable features.  Normalising all class
+    weights to unit length puts every class on equal footing at test time.
+
+    Steps:
+        1. Accumulate sum of backbone features per class label.
+        2. Divide by count → mean prototype per class.
+        3. L2-normalise each prototype.
+        4. Write the normalised prototype into the corresponding head weight row.
+           (Bias for those rows is zeroed — cosine classifier has no bias.)
+    """
+    model.eval()
+    feat_dim   = model.feature_dim
+    n_classes  = model._num_classes
+
+    proto_sum   = torch.zeros(n_classes, feat_dim, device=device)
+    proto_count = torch.zeros(n_classes, device=device)
+
+    with torch.no_grad():
+        for x, y in train_loader:
+            x, y = x.to(device), y.to(device)
+            feats = model.get_features(x)          # (B, 512)
+            for cls in y.unique():
+                mask = y == cls
+                proto_sum[cls]   += feats[mask].sum(0)
+                proto_count[cls] += mask.sum()
+
+    # Only update classes seen so far (count > 0)
+    seen = proto_count > 0
+    prototypes = proto_sum[seen] / proto_count[seen].unsqueeze(1)   # (K, 512)
+    prototypes = F.normalize(prototypes, dim=1)                      # unit length
+
+    with torch.no_grad():
+        model.head.weight[seen] = prototypes
+        model.head.bias[seen]   = 0.0
+
+    print(f"  [Prototype Alignment] Updated {seen.sum().item()} class weights.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
