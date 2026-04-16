@@ -54,9 +54,10 @@ def run_method(method_name: str, device: torch.device, align: bool = False) -> d
     method     = method_cls()
     model      = ContinualResNet().to(device)
 
-    acc_matrix = np.zeros((NUM_TASKS, NUM_TASKS))   # [after_task, task_id]
-    task_times = []
-    task_rams  = []
+    acc_matrix  = np.zeros((NUM_TASKS, NUM_TASKS))   # [after_task, task_id]
+    task_times  = []
+    task_rams   = []
+    proto_store = {}   # class_id -> normalised prototype; accumulated across tasks
 
     # Preload test loaders for all tasks (to evaluate older tasks later)
     all_test_loaders = []
@@ -102,7 +103,7 @@ def run_method(method_name: str, device: torch.device, align: bool = False) -> d
 
         # Optional prototype alignment (fixes logit imbalance / task-recency bias)
         if align:
-            apply_prototype_alignment(model, train_loader, task_id, device)
+            apply_prototype_alignment(model, train_loader, task_id, device, proto_store)
 
         # ── evaluation on all seen tasks ──────────────────────────────────────
         model.eval()
