@@ -15,11 +15,13 @@ class ContinualResNet(nn.Module):
     The classifier head expands by CLASSES_PER_TASK neurons after each task.
     """
 
-    def __init__(self, classes_per_task: int = CLASSES_PER_TASK):
+    def __init__(self, classes_per_task: int = CLASSES_PER_TASK,
+                 unfreeze_last_block: bool = False):
         super().__init__()
-        self.classes_per_task = classes_per_task
+        self.classes_per_task    = classes_per_task
+        self.unfreeze_last_block = unfreeze_last_block
 
-        # ── backbone (frozen) ────────────────────────────────────────────────
+        # ── backbone ─────────────────────────────────────────────────────────
         # Try pretrained weights; fall back to random init if offline
         try:
             backbone = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
@@ -31,8 +33,16 @@ class ContinualResNet(nn.Module):
 
         # Remove the original classification head
         self.backbone = nn.Sequential(*list(backbone.children())[:-1])
+
+        # Freeze entire backbone first
         for param in self.backbone.parameters():
             param.requires_grad = False
+
+        # Optionally unfreeze layer4 (backbone[7]) for fine-tuning
+        if unfreeze_last_block:
+            for param in self.backbone[7].parameters():
+                param.requires_grad = True
+            print("Unfrozen backbone layer4 for fine-tuning.")
 
         # ── head (trained) ───────────────────────────────────────────────────
         # Starts empty; call expand_head() before each task
@@ -63,14 +73,20 @@ class ContinualResNet(nn.Module):
         self._num_classes = new_total
 
     def get_trainable_params(self):
-        """Only the head parameters are trainable."""
-        return list(self.head.parameters())
+        """Head parameters, plus layer4 if unfrozen."""
+        params = list(self.head.parameters())
+        if self.unfreeze_last_block:
+            params += list(self.backbone[7].parameters())
+        return params
 
     # ── forward ──────────────────────────────────────────────────────────────
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad():
-            feats = self.backbone(x)          # (B, 512, 1, 1)
+        if self.unfreeze_last_block:
+            feats = self.backbone(x)          # gradients flow through layer4
+        else:
+            with torch.no_grad():
+                feats = self.backbone(x)
         feats = feats.flatten(1)              # (B, 512)
         return self.head(feats)               # (B, num_classes_so_far)
 

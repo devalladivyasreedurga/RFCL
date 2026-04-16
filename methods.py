@@ -92,10 +92,24 @@ class EWCMethod:
         ewc = self._ewc_penalty(model)
         return ce + self.ewc_lambda * ewc
 
+    def _param_dict(self, model) -> dict:
+        """
+        Returns {key: param} for all EWC-regularized parameters.
+        Head params use key 'head.<name>'; layer4 params use 'backbone7.<name>'
+        when the last block is unfrozen.
+        """
+        d = {f"head.{n}": p for n, p in model.head.named_parameters()}
+        if model.unfreeze_last_block:
+            d.update({f"backbone7.{n}": p
+                      for n, p in model.backbone[7].named_parameters()
+                      if p.requires_grad})
+        return d
+
     def after_task(self, model, task_id, train_loader, device):
         """Compute Fisher Information Matrix diagonal over the training set."""
-        means   = {n: p.data.clone() for n, p in model.head.named_parameters()}
-        fishers = {n: torch.zeros_like(p) for n, p in model.head.named_parameters()}
+        param_dict = self._param_dict(model)
+        means   = {k: p.data.clone()      for k, p in param_dict.items()}
+        fishers = {k: torch.zeros_like(p) for k, p in param_dict.items()}
 
         model.eval()
         count = 0
@@ -105,13 +119,13 @@ class EWCMethod:
             logits = model(x)
             loss = F.cross_entropy(logits, y)
             loss.backward()
-            for n, p in model.head.named_parameters():
+            for k, p in self._param_dict(model).items():
                 if p.grad is not None:
-                    fishers[n] += p.grad.data.clone().pow(2)
+                    fishers[k] += p.grad.data.clone().pow(2)
             count += 1
 
-        for n in fishers:
-            fishers[n] /= count          # average over batches
+        for k in fishers:
+            fishers[k] /= count          # average over batches
 
         self._means.append(means)
         self._fishers.append(fishers)
@@ -119,12 +133,17 @@ class EWCMethod:
     def _ewc_penalty(self, model) -> torch.Tensor:
         penalty = torch.tensor(0.0, device=next(model.head.parameters()).device)
         for means, fishers in zip(self._means, self._fishers):
-            for n, p in model.head.named_parameters():
-                if n in means:
-                    # Only penalise weights that existed at snapshot time
-                    old_size = means[n].shape[0]
-                    delta = p[:old_size] - means[n]
-                    penalty = penalty + (fishers[n] * delta.pow(2)).sum()
+            for k, p in self._param_dict(model).items():
+                if k not in means:
+                    continue
+                if k.startswith("head."):
+                    # Head grows across tasks — only penalise rows that existed
+                    old_size = means[k].shape[0]
+                    delta = p[:old_size] - means[k]
+                else:
+                    # Backbone params: fixed size
+                    delta = p - means[k]
+                penalty = penalty + (fishers[k] * delta.pow(2)).sum()
         return penalty
 
 

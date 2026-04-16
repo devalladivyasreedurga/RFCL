@@ -44,15 +44,20 @@ def get_device():
 
 # ── single method run ────────────────────────────────────────────────────────
 
-def run_method(method_name: str, device: torch.device, align: bool = False) -> dict:
-    label = method_name.upper() + (" + Prototype Alignment" if align else "")
+def run_method(method_name: str, device: torch.device,
+               align: bool = False, unfreeze: bool = False) -> dict:
+    label = method_name.upper()
+    if unfreeze:
+        label += " + Unfreeze Layer4"
+    if align:
+        label += " + Prototype Alignment"
     print(f"\n{'='*60}")
     print(f"  Method: {label}")
     print(f"{'='*60}")
 
     method_cls = METHOD_REGISTRY[method_name]
     method     = method_cls()
-    model      = ContinualResNet().to(device)
+    model      = ContinualResNet(unfreeze_last_block=unfreeze).to(device)
 
     acc_matrix  = np.zeros((NUM_TASKS, NUM_TASKS))   # [after_task, task_id]
     task_times  = []
@@ -120,10 +125,16 @@ def run_method(method_name: str, device: torch.device, align: bool = False) -> d
     print(f"  Mean time/task:          {np.mean(task_times):.1f}s")
     print(f"  Mean RAM Δ/task:         {np.mean(task_rams):.1f} MB")
 
-    result_key = f"{method_name}_align" if align else method_name
+    suffix = ""
+    if align:
+        suffix += "_align"
+    if unfreeze:
+        suffix += "_ft"
+    result_key = f"{method_name}{suffix}"
     results = {
         "method":       result_key,
         "align":        align,
+        "unfreeze":     unfreeze,
         "acc_matrix":   acc_matrix.tolist(),
         "aa":           round(aa * 100, 2),
         "bwt":          round(bwt * 100, 2),
@@ -147,6 +158,8 @@ def main():
                         choices=list(METHOD_REGISTRY.keys()) + ["all"])
     parser.add_argument("--align", action="store_true",
                         help="Apply prototype alignment after each task")
+    parser.add_argument("--unfreeze", action="store_true",
+                        help="Unfreeze ResNet-18 layer4 during training (fine-tune backbone)")
     args = parser.parse_args()
 
     device = get_device()
@@ -156,10 +169,15 @@ def main():
     all_results = {}
 
     for m in methods:
-        all_results[m] = run_method(m, device, align=args.align)
+        all_results[m] = run_method(m, device, align=args.align, unfreeze=args.unfreeze)
 
     if len(methods) > 1:
-        suffix = " (+align)" if args.align else ""
+        parts = []
+        if args.align:
+            parts.append("+align")
+        if args.unfreeze:
+            parts.append("+ft")
+        suffix = " (" + ", ".join(parts) + ")" if parts else ""
         print(f"\n\n── Summary Table{suffix} ─────────────────────────────────────")
         print(f"{'Method':<10} {'AA (%)':>8} {'BWT (%)':>9} {'Time/task (s)':>15} {'RAM Δ (MB)':>12}")
         print("-" * 58)
