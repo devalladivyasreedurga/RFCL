@@ -19,3 +19,4 @@ def prototype_alignment(model, dataloader, device):
         proto = feats.mean(dim=0)
         proto = F.normalize(proto, dim=0)
         model.classifier.weight.data[cls] = proto
+
