@@ -14,8 +14,10 @@ venv/
 .venv/
 env/
 
-# Dataset (too large for git — download via torchvision)
+# Datasets (too large for git)
 data/
+core50_eval/core50_data/
+core50_eval/data/
 
 # IDE / OS
 .vscode/
@@ -27,8 +29,23 @@ Thumbs.db
 # Claude internal
 .claude/
 
-# Loose plots at root (saved figures)
+# Loose plots at root
 Figure_1.png
+*.png
+
+# # Generated report plots (re-run plot_report.py to regenerate)
+# results/report_plots/
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.bbl
+*.blg
 
 # Jupyter
 .ipynb_checkpoints/

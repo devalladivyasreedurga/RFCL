@@ -1,0 +1,668 @@
+\documentclass{article}
+
+\usepackage{iclr2025_conference,times}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{microtype}
+\usepackage{enumitem}
+
+\title{Continual Learning on Split-CIFAR-100:\\
+Overcoming Catastrophic Forgetting Without Replay}
+
+\author{%
+  \parbox[t]{0.4\linewidth}{\centering
+    Divya Sree Durga Devalla \\
+    \texttt{ddeva@uic.edu}
+  }%
+  \hfill
+  \parbox[t]{0.4\linewidth}{\centering
+    Yuvaneswaren Ramakrishnan Sureshbabu \\
+    \texttt{yrama@uic.edu}
+  }\\[8pt]
+  \centering
+  Department of Computer Science \\
+  University of Illinois Chicago
+}
+
+\iclrfinalcopy
+
+\begin{document}
+
+\maketitle
+
+% ================================================================
+\begin{abstract}
+Catastrophic forgetting is one of the most persistent problems in sequential
+neural network training. When a model is updated on a new task, gradient updates
+tend to overwrite the weights that encoded earlier tasks, causing prior knowledge
+to simply disappear. This project explores how far a model can get on
+Split-CIFAR-100, a standard five-task continual learning benchmark, without
+storing or replaying any past training data. We implement and compare eight
+methods, starting from naive fine-tuning and working toward architectural
+solutions that sidestep forgetting rather than fight it with penalties. Our best
+configuration, a frozen Vision Transformer (ViT-B/16) backbone combined with
+per-task adapter networks and a non-parametric Nearest Class Mean (NCM)
+classifier, achieves 74.81\% average accuracy with only $-9.64\%$ backward
+transfer. That is a roughly six-fold improvement in accuracy and a seven-fold
+reduction in forgetting compared to the naive baseline (12.86\% AA,
+$-60.95\%$ BWT). The central finding is that eliminating trainable classifier
+weights and expanding the feature space incrementally per task is far more
+effective than any regularization scheme applied to a shared, mutable network.
+\end{abstract}
+
+% ================================================================
+\section{Introduction}
+\label{sec:intro}
+
+\subsection{The Problem}
+
+Humans accumulate knowledge over a lifetime without earlier skills disappearing
+when new ones are acquired. Neural networks trained with standard gradient
+descent do not share this property. When a network is updated on a new task,
+the parameter updates that improve performance on that task tend to overwrite
+whatever the network encoded before. This phenomenon, known as
+\textbf{catastrophic forgetting} \citep{kirkpatrick2017overcoming}, causes a
+model to excel at the most recent task while performing near chance on everything
+that came before it.
+
+This limitation has real consequences outside the lab. A radiology model that
+forgets earlier disease categories each time it is updated on a new disease
+cannot be trusted clinically. A robot controller that loses navigation skills
+whenever it learns a new manipulation behavior is impractical for deployment.
+The field of \textbf{continual learning} (also called lifelong or incremental
+learning) is dedicated to solving this problem: enabling a model to absorb new
+tasks sequentially without losing its grip on earlier ones \citep{li2017learning}.
+
+\subsection{Previous Work}
+
+Proposed solutions broadly fall into three families. \textbf{Replay-based}
+methods store a buffer of past examples and mix them into each new training
+round \citep{zhu2021prototype}. While effective, they raise storage and privacy
+concerns and are often impractical when past data simply cannot be kept.
+\textbf{Regularization-based} methods add penalty terms to the training loss
+that discourage large changes to parameters important for earlier tasks. Elastic
+Weight Consolidation (EWC) \citep{kirkpatrick2017overcoming} uses the Fisher
+Information Matrix to identify and protect critical weights, while Learning
+Without Forgetting (LwF) \citep{li2017learning} uses knowledge distillation to
+constrain output-space drift. \textbf{Architecture-based} methods take a
+different angle: rather than constraining how a shared network changes, they
+allocate dedicated capacity to each task so that new learning never touches old
+representations. Recent work has shown that combining strong pretrained
+backbones with task-specific modules can dramatically reduce forgetting in
+class-incremental settings \citep{zhou2024revisiting, zhang2023slca,
+zhu2021prototype}.
+
+A recurring theme in recent literature is that the quality of the pretrained
+backbone matters as much as the anti-forgetting strategy. Models pretrained on
+large datasets produce feature spaces rich enough that simple non-parametric
+classifiers can achieve strong performance, which sidesteps the classifier
+weight overwriting problem entirely \citep{zhou2024revisiting}.
+
+\subsection{Our Methods}
+
+This project takes a strictly replay-free stance: no past data is stored at any
+point. Within that constraint, we implemented and compared eight methods in order
+of increasing sophistication. The first four use a pretrained ResNet-18 backbone
+with a growing linear classification head and progressively stronger
+regularization: naive fine-tuning, Learning Without Forgetting, a hybrid of EWC
+and LwF, and standalone EWC. The fifth group repeats these regularization methods
+on a stronger frozen ViT-B/16 backbone. The final three methods abandon the
+trainable classification head entirely, instead using non-parametric Nearest
+Class Mean (NCM) inference over class prototypes stored in a fixed or
+incrementally expanding feature space. The best of these pairs a frozen
+ViT-B/16 backbone with per-task MLP adapters and NCM inference.
+
+\subsection{Summary of Results}
+
+The experiments tell a clear story. Regularization-based methods on ResNet-18
+plateau below 22\% average accuracy, regardless of which penalty is used.
+Switching to a stronger ViT-B/16 backbone nearly doubles this, but forgetting
+in the shared classifier remains severe. The decisive change comes from replacing
+the trainable head with an NCM classifier: this single architectural shift cuts
+backward transfer from roughly $-40\%$ to roughly $-10\%$ across all backbone
+types. Combining a frozen ViT-B/16 backbone with per-task adapters and NCM
+reaches 74.81\% average accuracy and $-9.64\%$ backward transfer, without
+storing a single past training example and without needing task identity at
+test time.
+
+% ================================================================
+\section{Problem Description}
+\label{sec:problem}
+
+\subsection{Task Setup and Evaluation}
+
+We work in the \textbf{class-incremental} continual learning setting, which is
+the more challenging of the standard continual learning protocols.
+
+\textbf{Split-CIFAR-100.} The primary benchmark partitions the 100 classes
+of CIFAR-100 \citep{zenke2017continual} into five disjoint groups of 20 classes
+each. The model is trained sequentially on Tasks 1 through 5 (classes 0--19,
+20--39, 40--59, 60--79, 80--99). At training time, only the current task's data
+is available and no replay buffer is maintained. At test time, the model must
+classify a query among all classes seen so far without any task identity
+information being provided. By the final task, the model is distinguishing among
+all 100 classes simultaneously.
+
+\textbf{CORe50.} To test whether our best approach generalises beyond
+Split-CIFAR-100, we additionally evaluate on CORe50 \citep{lomonaco2017core50},
+a continual learning benchmark built around 50 object categories captured across
+11 different sessions (varying backgrounds, lighting, and viewpoints). 
+
+The two metrics tracked throughout are:
+\begin{itemize}[leftmargin=*]
+  \item \textbf{Average Accuracy (AA):} the mean of per-task test accuracies
+    evaluated after all five tasks have been trained. This captures both
+    plasticity (learning new tasks well) and stability (retaining old ones).
+  \item \textbf{Backward Transfer (BWT):} the average drop in accuracy on
+    previously seen tasks caused by training on subsequent ones. A BWT of 0
+    means no forgetting; more negative values indicate more severe forgetting.
+\end{itemize}
+
+Formally, let $R_{i,j}$ denote test accuracy on Task $i$ right after training
+on Task $j$, where $j \geq i$. Then:
+\begin{align}
+  \text{AA}  &= \frac{1}{T} \sum_{i=1}^{T} R_{i,T}, \\[4pt]
+  \text{BWT} &= \frac{1}{T-1} \sum_{i=1}^{T-1}
+               \bigl(R_{i,T} - R_{i,i}\bigr),
+\end{align}
+where $T = 5$ is the total number of tasks.
+
+% -------------------------------------------------------
+\subsection{Methods}
+\label{sec:methods}
+
+We implemented eight methods in total, each building on the lessons of the
+previous one. All experiments use PyTorch with Adam optimizer ($lr = 10^{-3}$)
+and 5 epochs per task unless otherwise noted.
+
+The core problem with sequential training is that every gradient update on a
+new task pushes the model's weights in a direction that improves new-task
+performance, but nothing forces those updates to stay within the region of
+weight space that preserved old-task performance. Old knowledge is simply
+overwritten. The methods below attack this problem with increasing architectural
+ambition, from adding soft penalties on top of the same shared network, to
+abandoning the shared network structure altogether.
+
+\subsubsection{Naive Fine-Tuning (Baseline)}
+
+The simplest approach: train on each task in sequence with no modifications,
+using a pretrained ResNet-18 backbone with a growing linear classification head
+that adds 20 output neurons per task. Nothing prevents forgetting, making this
+the lower bound all other methods must beat.
+As expected, the model forgets nearly everything it has learned by the final task, with accuracy collapsing to near chance across all earlier tasks.
+
+\subsubsection{Learning Without Forgetting (LwF)}
+
+Before each new task, the current model is frozen as a ``teacher.'' As the
+live model trains on new data, it is also penalised for drifting away from the
+teacher's predictions on old classes. The distillation loss is:
+\begin{equation}
+  \mathcal{L}(\theta) \;=\; \mathcal{L}_{\mathrm{CE}}(\theta) \;+\;
+  \lambda_{\mathrm{KD}} \cdot \mathcal{L}_{\mathrm{KD}}(\theta),
+  \label{eq:lwf_total}
+\end{equation}
+where $\lambda_{\mathrm{KD}}$ grows with each task. The limitation is that
+the teacher only sees new-task images, so its guidance weakens as the backbone
+shifts over time.
+Distillation provides a real but modest improvement over naive fine-tuning, and forgetting remains severe because the teacher's guidance degrades as the backbone shifts.
+
+\subsubsection{Elastic Weight Consolidation (EWC)}
+
+Instead of constraining predictions, EWC \citep{kirkpatrick2017overcoming}
+constrains which weights are allowed to change. After each task, the Fisher
+Information Matrix identifies which weights mattered most. Those weights are
+then anchored by a quadratic penalty during the next task:
+\begin{equation}
+  \mathcal{L}(\theta) \;=\; \mathcal{L}_{t+1}(\theta) \;+\;
+  \frac{\lambda}{2} \sum_{k} F^{(t)}_k
+  \bigl(\theta_k - \theta_{t,k}^*\bigr)^2,
+  \label{eq:ewc}
+\end{equation}
+where $\lambda = 10{,}000$. Important weights are held in place; unimportant
+ones remain free to adapt.
+EWC is the strongest regularization method tested, though it still plateaus well below what architectural changes later achieve.
+
+\subsubsection{Hybrid (EWC + LwF)}
+
+Both penalties are applied simultaneously: EWC protects important weights
+while LwF keeps output predictions consistent with the teacher.
+\begin{equation}
+  \mathcal{L}(\theta) \;=\;
+  \mathcal{L}_{\mathrm{CE}} \;+\;
+  \lambda_{\mathrm{EWC}} \cdot \mathcal{L}_{\mathrm{EWC}} \;+\;
+  \lambda_{\mathrm{KD}}^{\mathrm{adapt}} \cdot \mathcal{L}_{\mathrm{KD}}.
+\end{equation}
+In practice the two constraints can pull in opposite directions, limiting
+how much each individually contributes.
+Combining the two penalties improves backward transfer slightly over standalone LwF, but adds little over EWC alone since the two objectives partially conflict.
+
+Across all four regularization methods, replacing linear head weights with L2-normalised class mean vectors after each task (prototype alignment correction) reduces backward transfer from roughly $-39\%$ to $-9\%$ with no loss in average accuracy, because a frozen backbone keeps the feature space stable between tasks. Adding backbone fine-tuning raises per-task training accuracy to $59$--$63\%$ but reintroduces catastrophic forgetting, since shifting the feature space for a new task invalidates the stored prototypes of all prior ones. The best configuration within the regularization family is therefore a frozen backbone with alignment correction, and even this reaches a hard ceiling that the architectural changes below later break through.
+
+\subsubsection{ViT-B/16 Backbone with Regularization}
+
+Rather than changing the training strategy, we ask: what if the model starts
+with better features? We replace ResNet-18 with a frozen ViT-B/16
+\citep{dosovitskiy2020image}, raising feature dimensionality from 512 to 768.
+Only the classification head is trained. The shared mutable head problem
+remains, but stronger features raise the accuracy ceiling noticeably.
+Better features lift accuracy substantially across all three methods, but forgetting in the shared classifier remains just as persistent as with ResNet-18.
+
+\subsubsection{Prototype-Based Classification (PASS)}
+
+All methods above share one structural weakness: a single set of classification
+weights that all tasks must overwrite. Instead, we store the average feature
+vector of each class as a \textbf{prototype} and classify by nearest distance:
+\begin{equation}
+  \mu_c = \frac{1}{|S_c|} \sum_{x \in S_c} f_\theta(x), \qquad
+  \hat{y} = \arg\min_{c}\;\|f_\theta(x) - \mu_c\|_2.
+\end{equation}
+With a frozen backbone, no prototype can interfere with any other; forgetting
+in the classifier is structurally impossible. Each class is also augmented with
+50 synthetic feature vectors sampled from its feature covariance to produce
+more robust prototypes.
+Switching to a prototype-based classifier more than doubles accuracy over the best regularization result, with far less forgetting and no penalty terms at all.
+
+\subsubsection{ADAM: Per-Task Adapters with NCM (Our Best Method)}
+
+Even with frozen features, packing 100 class prototypes into a fixed-dimensional
+space causes crowding. ADAM solves this by giving each task its own small
+two-layer MLP \textbf{adapter} that is trained on that task and then permanently
+frozen. After $t$ tasks, the final feature is the original backbone output
+concatenated with all adapter outputs, giving an expanding
+$(d + t \times 128)$-dimensional vector where $d$ is 512 for ResNet-18 and
+768 for ViT-B/16. Class prototypes are recomputed in this growing space after
+every task, and a Tukey power transform with L2 normalisation is applied
+before NCM inference. New tasks add capacity without touching anything
+already learned.
+This is our best result: high accuracy across all tasks on both benchmarks, with near-zero forgetting and no stored training data.
+Figure~\ref{fig:adam_flowchart} illustrates the full pipeline.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.55\linewidth]{adam_flowchart.png}
+  \caption{ADAM architecture: frozen backbone features are concatenated with
+    per-task adapter outputs, Tukey-transformed, and classified via NCM.}
+  \label{fig:adam_flowchart}
+\end{figure}
+
+% ================================================================
+\section{Results}
+\label{sec:results}
+
+Table~\ref{tab:results} summarizes average accuracy and backward transfer for
+all ten configurations. Figure~\ref{fig:comparison} shows per-task forgetting
+curves for three representative configurations spanning the full range of
+behaviours observed. Figure~\ref{fig:ablation_bars} details the complete
+ablation over all four regularization methods and three training regimes.
+
+\begin{table}[h]
+\centering
+\caption{All methods on Split-CIFAR-100 in the class-incremental setting.
+AA = Average Accuracy after all five tasks. BWT = Backward Transfer (closer
+to 0 is better). All methods are fully replay-free.}
+\label{tab:results}
+\renewcommand{\arraystretch}{1.25}
+\begin{tabular}{llccc}
+\toprule
+\textbf{Method} & \textbf{Backbone} & \textbf{Classifier}
+  & \textbf{AA (\%)} & \textbf{BWT (\%)} \\
+\midrule
+Naive Fine-Tuning                  & ResNet-18 & Linear Head & 12.86 & $-60.95$ \\
+LwF                                & ResNet-18 & Linear Head & 16.58 & $-56.09$ \\
+Hybrid (EWC + LwF)                 & ResNet-18 & Linear Head & 17.56 & $-43.24$ \\
+EWC                                & ResNet-18 & Linear Head & 21.73 & $-40.66$ \\
+\midrule
+ViT Naive                          & ViT-B/16  & Linear Head & 36.32 & $-69.58$ \\
+ViT LwF                            & ViT-B/16  & Linear Head & 36.15 & $-69.62$ \\
+ViT EWC                            & ViT-B/16  & Linear Head & 41.14 & $-62.88$ \\
+\midrule
+ResNet-18 + Adapters + NCM         & ResNet-18 & NCM         & 47.63 & $-15.54$ \\
+Frozen ResNet-18 + Proto Aug + NCM & ResNet-18 & NCM         & 57.20 & $-10.79$ \\
+\textbf{ViT + Adapters + NCM}
+  & \textbf{ViT-B/16} & \textbf{NCM}
+  & \textbf{74.81} & $\mathbf{-9.64}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{final_fig3_forgetting_curves.png}
+  \caption{Per-task accuracy over the training sequence for three representative
+    configurations: Naive (complete collapse), EWC+Align (gradual decay, retained
+    memory), and LwF+Align+FT (high plasticity but sharp forgetting).}
+  \label{fig:comparison}
+\end{figure}
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[scale=0.4]{final_fig1_grouped_bars.png}
+  \caption{AA (top) and BWT (bottom) for all twelve regularization configurations
+    (four methods $\times$ three regimes: Base, +Align, +Align+FT). Alignment
+    correction alone cuts BWT from $-39\%$ to $-9\%$; backbone fine-tuning reverses this gain.}
+  \label{fig:ablation_bars}
+\end{figure}
+
+\subsection{Regularization-Based Methods on ResNet-18}
+
+The naive baseline makes the severity of catastrophic forgetting immediately
+visible. Each task reaches around 60\% accuracy right after its own training,
+then collapses toward 0\% as later tasks are trained
+(Figure~\ref{fig:comparison}). The peak single-task accuracy of 63.9\% stands
+in stark contrast to the final AA of just 12.86\%, and by the time Task 5 is
+complete the model has essentially forgotten everything about Tasks 1 through 4,
+with a BWT of $-60.95\%$.
+
+LwF improves AA to 16.58\% and BWT to $-56.09\%$, a real but modest gain. Task
+1 still drops to near 0\% by the end of training. The distillation objective
+constrains the model's output behavior, but it operates only on new-task inputs,
+making it an imperfect proxy for preserving old-task knowledge. When layer 4 is
+also fine-tuned, backbone feature drift weakens the old teacher signals further
+over time.
+
+The Hybrid EWC and LwF combination reaches 17.56\% AA and $-43.24\%$ BWT.
+Combining the two objectives helps BWT more than AA. In practice the two
+regularizers work against each other to some degree: EWC anchors specific
+parameter values while LwF simultaneously pushes output distributions to track
+a frozen snapshot. These competing gradients reduce how much each penalty can
+individually contribute.
+
+Standalone EWC is the best of the four regularization methods on ResNet-18,
+achieving 21.73\% AA and $-40.66\%$ BWT. The Fisher-weighted penalty is more
+targeted than LwF's behavioral constraint because it works directly on parameter
+values ranked by importance, rather than approximating importance through output
+space. Even so, 21.73\% across five tasks reveals a hard ceiling. The cause is
+structural: all tasks share the same weight space, and regularization can only
+slow drift, not eliminate the capacity conflict.
+
+\subsection{Stronger Features: ViT-B/16 with a Linear Head}
+
+Replacing ResNet-18 with a frozen ViT-B/16 backbone nearly doubles accuracy
+across equivalent methods. ViT EWC reaches 41.14\%, compared to ResNet-18 EWC
+at 21.73\%. The richer 768-dimensional features give the linear classifier
+significantly better material to work with from the start.
+
+Interestingly, ViT Naive and ViT LwF perform almost identically (36.32\% vs.
+36.15\%) and both show worse BWT than their ResNet-18 counterparts. With the
+backbone frozen, only the growing classification head is trainable. LwF's
+distillation over old head outputs is fighting against a head that expands by 20
+neurons at every task in a class-incremental setting where all accumulated
+classes must be distinguished simultaneously. Better features raise the accuracy
+ceiling, but the forgetting mechanism in the shared classifier is completely
+intact.
+
+\subsection{Structural Fix: NCM Classifier with a Frozen Backbone}
+
+The biggest single improvement in the entire experiment series happens when the
+trainable head is replaced with NCM. The Frozen ResNet-18 with Prototype
+Augmentation and NCM method achieves 57.20\% AA and $-10.79\%$ BWT using no
+regularization at all. Compared to the best regularization result (ResNet-18
+EWC: 21.73\% AA, $-40.66\%$ BWT), this is a 2.6x gain in accuracy and a 4x
+reduction in forgetting, from a change in architecture alone.
+
+Task 1's accuracy trajectory tells the story clearly. Under naive fine-tuning,
+Task 1 goes from roughly 60\% right after training to nearly 0\% after five
+tasks: near-total collapse. Under Frozen ResNet-18 with NCM, Task 1 goes from
+78.7\% to 58.2\% across the same five tasks. This is real degradation but it is
+gradual, caused by feature space crowding as 100 class prototypes are packed
+into a 512-dimensional space, not by weight overwriting.
+
+Prototype augmentation (sampling 50 synthetic feature vectors per class from
+the class-level feature covariance) helps reduce crowding by giving each class
+a more statistically robust centroid estimate, particularly for high-variance
+classes.
+
+\subsection{Per-Task Adapters on ResNet-18}
+
+The ResNet-18 with Per-Task Adapters and NCM method adds a dedicated MLP adapter
+per task. Somewhat counterintuitively, it scores below the simpler Frozen
+ResNet-18 with Prototype Augmentation approach (47.63\% vs. 57.20\% AA). The
+adapters do further reduce forgetting ($-15.54\%$ BWT), but the ResNet-18 base
+features are not rich enough to anchor the task-specific adapter representations
+well. This result directly motivates the move to a stronger backbone.
+
+\subsection{Generalisation to CORe50}
+
+We evaluated the naive baseline and our best method on CORe50 NC
+\citep{lomonaco2017core50} (50 object classes, 5 tasks of 10 classes each)
+to test whether the results hold beyond Split-CIFAR-100.
+Table~\ref{tab:core50} shows the results alongside the CIFAR-100 numbers
+for direct comparison.
+
+\begin{table}[h]
+\centering
+\caption{Naive baseline vs.\ ViT + Adapters + NCM on both benchmarks.
+Same class-incremental, replay-free protocol throughout.}
+\label{tab:core50}
+\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{llcc}
+\toprule
+\textbf{Dataset} & \textbf{Method} & \textbf{AA (\%)} & \textbf{BWT (\%)} \\
+\midrule
+Split-CIFAR-100 & Naive (ViT)          & 36.32 & $-69.58$ \\
+Split-CIFAR-100 & ViT + Adapters + NCM & 74.81 & $-9.64$  \\
+\midrule
+CORe50 NC       & Naive (ViT)          & 40.11 & $-63.89$ \\
+CORe50 NC       & ViT + Adapters + NCM & \textbf{86.52} & $\mathbf{-2.62}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The adapter method improves further on CORe50 (86.52\% AA, $-2.62\%$ BWT),
+likely because each task has only 10 classes instead of 20, reducing
+classifier crowding. The near-zero BWT confirms that the architecture
+generalises well across datasets.
+
+\subsection{Best Result: ViT-B/16 with Per-Task Adapters and NCM}
+
+This method brings together every design choice from the prior experiments.
+A frozen ViT-B/16 backbone supplies strong, stable 768-dimensional features.
+Per-task MLP adapters trained on each task and then permanently frozen add
+discriminative capacity without touching anything learned before. NCM inference
+over the growing concatenated feature space handles class-incremental queries
+by comparing against all stored prototypes simultaneously, with no task identity
+required. A Tukey power transform and L2 normalisation are applied before
+distance computation.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=0.85\linewidth]{vit_adapters_bar.png}
+  \caption{Per-task accuracy after full five-task training for all four
+    ViT-based methods. ViT Naive, ViT LwF, and ViT EWC all show severe
+    forgetting on early tasks, with Tasks 1 and 2 dropping well below 50\%
+    by the end of training. Our best method, ViT + Adapters + NCM, maintains
+    consistently high accuracy across all five tasks, reaching 74.81\% AA
+    and only $-9.64\%$ BWT in the class-incremental setting.}
+  \label{fig:best_bar}
+\end{figure}
+
+The final result is 74.81\% AA and $-9.64\%$ BWT across five tasks
+(Figure~\ref{fig:best_bar}). Task 1, which is the most exposed to subsequent
+task interference, retains 75.8\% accuracy at the very end of five-task
+training, down from 92.5\% immediately after its own training. Every task
+achieves between 70\% and 93\% accuracy at the end of the full sequence.
+Figure~\ref{fig:forgetting_vit} shows this directly: while naive fine-tuning
+causes all earlier tasks to collapse as training progresses, ADAM's task lines
+remain stable throughout. The single most impactful architectural decision
+across all configurations is the classifier type: switching from a trainable
+linear head to NCM reduces BWT from roughly $-40\%$ to roughly $-10\%$
+regardless of backbone choice.
+
+\begin{figure}[h]
+  \centering
+  \includegraphics[width=\linewidth]{best_result.png}
+  \caption{Forgetting curves for Naive ViT (left) vs.\ ADAM (right) on
+    Split-CIFAR-100. Each coloured line tracks one task's accuracy as
+    subsequent tasks are trained. Under naive fine-tuning all earlier tasks
+    collapse toward 0\% as soon as a new task begins. Under ADAM, every
+    task's accuracy remains stable throughout training, demonstrating that
+    the adapter and NCM design structurally eliminates forgetting.}
+  \label{fig:forgetting_vit}
+\end{figure}
+
+% ================================================================
+\section{Conclusions and Future Work}
+\label{sec:conclusions}
+
+\subsection{Main Contributions}
+
+This project asked how much of the catastrophic forgetting problem can be solved
+in a fully replay-free, class-incremental setting. The answer is: quite a lot,
+provided the architecture is redesigned rather than just the training objective.
+
+Regularization-based methods (EWC, LwF, and their combination) plateau below
+22\% AA on ResNet-18 and below 42\% on ViT-B/16. No amount of hyperparameter
+tuning within this family fixes the root cause: all tasks competing for the same
+weights in a shared, mutable network. Regularizers slow drift but cannot stop
+it.
+
+The breakthrough comes from replacing the trainable classifier with a
+non-parametric one. When there are no classification weights to overwrite,
+that source of forgetting is eliminated by design. Adding per-task adapters on
+top of a strong frozen backbone incrementally expands the feature space, giving
+each class a richer and more discriminative description without disturbing
+anything already learned. Our best model reaches 74.81\% AA and $-9.64\%$ BWT
+without storing a single past training example and without requiring task
+identity at test time.
+
+\subsection{Lessons Learned}
+
+Working through eight progressively better configurations made several things
+very concrete:
+
+\begin{enumerate}[leftmargin=*]
+  \item Regularization targets a symptom (weight drift) rather than the cause
+    (shared mutable capacity). It has a hard ceiling, especially in
+    class-incremental settings where the classifier must simultaneously
+    distinguish all accumulated classes.
+  \item Non-parametric classifiers like NCM are a natural fit for replay-free
+    class-incremental learning. Adding a new class prototype never overwrites
+    information about an old one, and no task routing is needed at inference.
+  \item Per-task adapters with permanent freezing expand representational
+    capacity incrementally. The feature space grows richer over time without
+    any corruption of past representations.
+  \item The quality of the base backbone matters enormously. Adapters built on
+    weak ResNet-18 features underperform a simple prototype-only approach. On
+    ViT-B/16 features, the same adapters add substantial value.
+  \item AA and BWT do not always move together. Some configurations show
+    acceptable BWT but poor AA because the initial per-task accuracy was already
+    low. Both metrics need to be tracked and reported together to get an honest
+    picture of continual learning performance.
+\end{enumerate}
+
+\subsection{Future Work}
+
+Several directions are worth exploring from here:
+
+\textbf{Larger backbones.} ViT-L/16 or CLIP-pretrained models produce even
+richer feature representations. Pairing those with the adapter and NCM framework
+could push AA above 80\% in the class-incremental setting while keeping
+forgetting near zero.
+
+\textbf{Adapter architecture search.} Our adapters use a fixed two-layer MLP
+with 128-dimensional output. Systematically exploring adapter depth, width, and
+connectivity (including residual paths) could find a better tradeoff between
+added capacity and inference latency.
+
+\textbf{Harder benchmarks.} Split-CIFAR-100 has clean disjoint task boundaries.
+Domain-incremental benchmarks like CORe50, or larger-scale datasets like
+Split-ImageNet, would test whether these architectural choices hold up in more
+realistic and challenging scenarios.
+
+\textbf{Minimal rehearsal.} Even a very small replay buffer (around 20 examples
+per class) combined with the adapter and NCM framework might close the remaining
+accuracy gap without meaningfully violating the memory constraint.
+
+\textbf{Inference scalability.} As more tasks are added, the concatenated
+feature vector and prototype store both grow. At 20 or more tasks this starts
+to matter for latency. Approximate nearest-neighbor search or prototype
+compression could keep inference fast without hurting accuracy.
+
+% ================================================================
+\section{Code}
+\label{sec:code}
+
+All code for this project, including data preprocessing, model implementations
+for all eight methods, training scripts, and evaluation utilities, is available
+in our GitHub repository:
+
+\begin{center}
+  \url{https://github.com/devalladivyasreedurga/RFCL}
+\end{center}
+
+The repository is organized as follows. The \texttt{models/} directory contains
+implementations of each method, from naive fine-tuning through the ViT adapter
+architecture. The \texttt{train.py} script runs any of the eight methods on
+Split-CIFAR-100 with configurable hyperparameters. The \texttt{evaluate.py}
+script computes AA and BWT after training. The \texttt{notebooks/} directory
+contains the plotting code used to generate the figures in this report.
+Dependencies are listed in \texttt{requirements.txt} and the full experimental
+setup is documented in the repository README.
+
+% ================================================================
+\section*{References}
+
+\begingroup
+\renewcommand{\section}[2]{}
+\begin{thebibliography}{10}
+
+\bibitem{kirkpatrick2017overcoming}
+J.~Kirkpatrick, R.~Pascanu, N.~Rabinowitz, J.~Veness, G.~Desjardins,
+A.~A.~Rusu, K.~Milan, J.~Quan, T.~Ramalho, A.~Grabska-Barwinska,
+D.~Hassabis, C.~Clopath, D.~Kumaran, and R.~Hadsell.
+\newblock Overcoming catastrophic forgetting in neural networks.
+\newblock \emph{Proceedings of the National Academy of Sciences},
+  114(13):3521--3526, 2017.
+
+\bibitem{li2017learning}
+Z.~Li and D.~Hoiem.
+\newblock Learning without forgetting.
+\newblock In \emph{European Conference on Computer Vision (ECCV)}, 2016.
+
+\bibitem{zhang2023slca}
+G.~Zhang, L.~Wang, G.~Kang, L.~Chen, and Y.~Wei.
+\newblock {SLCA}: Slow learner with classifier alignment for continual learning
+  on a pre-trained model.
+\newblock In \emph{International Conference on Computer Vision (ICCV)}, 2023.
+
+\bibitem{zhu2021prototype}
+F.~Zhu, X.-Y.~Zhang, C.~Wang, F.~Yin, and C.-L.~Liu.
+\newblock Prototype augmentation and self-supervision for incremental learning.
+\newblock In \emph{Proceedings of the IEEE/CVF Conference on Computer Vision
+  and Pattern Recognition (CVPR)}, pages 5871--5880, 2021.
+
+\bibitem{zhou2024revisiting}
+D.-W.~Zhou, Z.-W.~Cai, H.-J.~Ye, D.-C.~Zhan, and Z.~Liu.
+\newblock Revisiting class-incremental learning with pre-trained models:
+  Generalizability and adaptivity are all you need.
+\newblock \emph{International Journal of Computer Vision}, 133:1012--1032,
+  2024.
+
+\bibitem{dosovitskiy2020image}
+A.~Dosovitskiy, L.~Beyer, A.~Kolesnikov, D.~Weissenborn, X.~Zhai,
+T.~Unterthiner, M.~Dehghani, M.~Minderer, G.~Heigold, S.~Gelly,
+J.~Uszkoreit, and N.~Houlsby.
+\newblock An image is worth 16x16 words: Transformers for image recognition
+  at scale.
+\newblock In \emph{International Conference on Learning Representations
+  (ICLR)}, 2021.
+
+\bibitem{lomonaco2017core50}
+V.~Lomonaco and D.~Maltoni.
+\newblock {CORe50}: a new dataset and benchmark for continuous object
+  recognition.
+\newblock In \emph{Conference on Robot Learning (CoRL)}, 2017.
+
+\bibitem{zenke2017continual}
+F.~Zenke, B.~Poole, and S.~Ganguli.
+\newblock Continual learning through synaptic intelligence.
+\newblock In \emph{International Conference on Machine Learning (ICML)}, 2017.
+
+\end{thebibliography}
+\endgroup
+
+\end{document}
